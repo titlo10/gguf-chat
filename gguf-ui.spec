@@ -16,10 +16,8 @@ except Exception:
 
 if IS_WIN:
     datas += [
-        (os.path.join("build", "llama_vulkan", "llama_cpp"),
-         os.path.join("llama_vulkan", "llama_cpp")),
-        (os.path.join("build", "llama_cpu", "llama_cpp"),
-         os.path.join("llama_cpp_cpu", "llama_cpp")),
+        (os.path.join("build", "llama_vulkan"), "llama_vulkan"),
+        (os.path.join("build", "llama_cpu"), "llama_cpp_cpu"),
     ]
     _vk = os.path.join("redist", "vulkan-1.dll")
     if os.path.isfile(_vk):

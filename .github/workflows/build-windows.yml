@@ -51,6 +51,11 @@ jobs:
           $root = "dist/GGUFChat/_internal"
           if (!(Test-Path "$root/llama_vulkan/llama_cpp/lib/ggml-vulkan.dll")) { throw "В сборке нет бэкенда Vulkan" }
           if (!(Test-Path "$root/llama_cpp_cpu/llama_cpp/lib/ggml-cpu.dll"))   { throw "В сборке нет бэкенда CPU" }
+          foreach ($b in @("llama_vulkan", "llama_cpp_cpu")) {
+            foreach ($dep in @("diskcache", "numpy", "jinja2")) {
+              if (!(Test-Path "$root/$b/$dep")) { throw "В бэкенде $b нет зависимости $dep" }
+            }
+          }
           Write-Host "Сборка в порядке."
 
       - name: Упаковать в ZIP
