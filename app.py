@@ -11,6 +11,8 @@ import traceback
 import faulthandler
 import subprocess
 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 
