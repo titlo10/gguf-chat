@@ -8,6 +8,7 @@ import queue
 import importlib
 import threading
 import traceback
+import faulthandler
 import subprocess
 
 import tkinter as tk
@@ -219,7 +220,10 @@ class BackendManager:
             sys.path.insert(0, path)
             self._injected.append(path)
         importlib.invalidate_caches()
-        return importlib.import_module("llama_cpp")
+        dbg("import_backend: import_module('llama_cpp') from %s" % path)
+        mod = importlib.import_module("llama_cpp")
+        dbg("import_backend: import_module done")
+        return mod
 
 
 class Attempt:
@@ -277,6 +281,8 @@ def _run_worker():
     backends = BackendManager()
     state = {"llm": None}
     dbg("worker ready")
+    if DEBUG:
+        faulthandler.enable()
 
     while True:
         msg = cmds.get()
@@ -284,8 +290,12 @@ def _run_worker():
         if cmd == "quit":
             break
         elif cmd == "meta":
+            if DEBUG:
+                faulthandler.dump_traceback_later(25, repeat=True)
             try:
+                dbg("meta: import backend " + str(msg.get("backend_path")))
                 lc = backends.import_backend(msg.get("backend_path"))
+                dbg("meta: vocab_only Llama")
                 m = lc.Llama(model_path=msg["model"], vocab_only=True, verbose=False)
                 n_layer = None
                 try:
@@ -297,8 +307,14 @@ def _run_worker():
                     pass
                 send({"ev": "meta", "n_layer": n_layer})
             except Exception as exc:
+                dbg("meta: FAILED " + repr(exc))
                 send({"ev": "error", "msg": repr(exc)})
+            finally:
+                if DEBUG:
+                    faulthandler.cancel_dump_traceback_later()
         elif cmd == "load":
+            if DEBUG:
+                faulthandler.dump_traceback_later(25, repeat=True)
             try:
                 dbg("load: import backend " + str(msg.get("backend_path")))
                 lc = backends.import_backend(msg.get("backend_path"))
@@ -327,6 +343,9 @@ def _run_worker():
             except Exception as exc:
                 dbg("load: FAILED " + repr(exc))
                 send({"ev": "error", "msg": repr(exc)})
+            finally:
+                if DEBUG:
+                    faulthandler.cancel_dump_traceback_later()
         elif cmd == "gen":
             m = state["llm"]
             if m is None:
