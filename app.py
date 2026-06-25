@@ -17,9 +17,32 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 APP_TITLE = "GGUF Чат"
 SHIFT_MASK = 0x0001
 CREATE_NO_WINDOW = 0x08000000
-META_TIMEOUT = 60.0
-LOAD_TIMEOUT = 300.0
+
+
+def _console_attached() -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return False
+
+
+DEBUG = bool(os.environ.get("GGUF_DEBUG")) or _console_attached()
+
+META_TIMEOUT = 30.0 if DEBUG else 60.0
+LOAD_TIMEOUT = 120.0 if DEBUG else 300.0
 GEN_TIMEOUT = 600.0
+
+
+def dbg(msg):
+    if not DEBUG:
+        return
+    try:
+        print("[gguf] " + str(msg), file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 class Msg(enum.Enum):
@@ -129,6 +152,9 @@ class NativeLog:
         self._start = 0
 
     def __enter__(self):
+        if DEBUG:
+            self._ok = False
+            return self
         try:
             self._fh = open(self.path, "a+b")
             self._start = self._fh.seek(0, os.SEEK_END)
@@ -250,6 +276,7 @@ def _run_worker():
 
     backends = BackendManager()
     state = {"llm": None}
+    dbg("worker ready")
 
     while True:
         msg = cmds.get()
@@ -273,8 +300,10 @@ def _run_worker():
                 send({"ev": "error", "msg": repr(exc)})
         elif cmd == "load":
             try:
+                dbg("load: import backend " + str(msg.get("backend_path")))
                 lc = backends.import_backend(msg.get("backend_path"))
                 cap = NativeLog(log_path())
+                dbg("load: constructing Llama ngl=%s n_ctx=%s" % (msg.get("ngl"), msg.get("n_ctx")))
                 with cap:
                     m = lc.Llama(
                         model_path=msg["model"],
@@ -282,6 +311,7 @@ def _run_worker():
                         n_gpu_layers=int(msg["ngl"]),
                         verbose=True,
                     )
+                dbg("load: Llama constructed OK")
                 try:
                     m.verbose = False
                 except Exception:
@@ -292,8 +322,10 @@ def _run_worker():
                 except Exception:
                     pass
                 state["llm"] = m
+                dbg("load: sending loaded")
                 send({"ev": "loaded", "gpu_ok": gpu_ok, "offloaded": parse_offloaded(cap.text)})
             except Exception as exc:
+                dbg("load: FAILED " + repr(exc))
                 send({"ev": "error", "msg": repr(exc)})
         elif cmd == "gen":
             m = state["llm"]
@@ -337,17 +369,27 @@ class LlmEngine:
         return [sys.executable, os.path.abspath(__file__), "--worker"]
 
     def _new_worker(self):
-        flags = CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        win = sys.platform.startswith("win")
+        if DEBUG:
+            flags = 0
+            werr = None
+            wenv = {**os.environ, "GGUF_DEBUG": "1"}
+        else:
+            flags = CREATE_NO_WINDOW if win else 0
+            werr = subprocess.DEVNULL
+            wenv = None
         proc = subprocess.Popen(
             self._worker_argv(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=werr,
             text=True,
             encoding="utf-8",
             bufsize=1,
             creationflags=flags,
+            env=wenv,
         )
+        dbg("spawned worker pid=%s" % proc.pid)
         q = queue.Queue()
 
         def pump():
@@ -482,8 +524,10 @@ class LlmEngine:
         while True:
             kind, line = self._next(q, LOAD_TIMEOUT)
             if kind == "eof":
+                dbg("worker EOF before load result (crashed)")
                 return {"ev": "error", "msg": self._crash_hint()}
             if kind == "timeout":
+                dbg("LOAD_TIMEOUT %ss with no result" % LOAD_TIMEOUT)
                 return {"ev": "error", "msg": "таймаут загрузки (возможно, зависание драйвера)"}
             try:
                 ev = json.loads(line)
@@ -521,6 +565,7 @@ class LlmEngine:
         errors = []
         for attempt in self._plan(requested_ngl, n_layer):
             log(f"Пробую: {attempt.label} …")
+            dbg("attempt: %s backend=%s ngl=%s" % (attempt.label, attempt.path, attempt.n_gpu_layers))
             proc, q = self._new_worker()
             try:
                 self._send(proc, {
@@ -534,6 +579,7 @@ class LlmEngine:
             except Exception as exc:
                 ev = {"ev": "error", "msg": str(exc)}
 
+            dbg("attempt result: %s %s" % (ev.get("ev"), (ev.get("msg") or "")[:300]))
             if ev.get("ev") == "loaded":
                 self.proc = proc
                 self._q = q
@@ -946,6 +992,7 @@ def main():
     if "--worker" in sys.argv[1:]:
         worker_main()
         return
+    dbg("GUI start; DEBUG=%s platform=%s" % (DEBUG, sys.platform))
     ChatApp().mainloop()
 
 

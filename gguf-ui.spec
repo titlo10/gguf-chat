@@ -2,7 +2,7 @@ import os
 import sys
 
 IS_WIN = sys.platform.startswith("win")
-APP_NAME = "GGUFChat"
+APP_NAME = os.environ.get("GGUF_APP_NAME", "GGUFChat")
 
 datas = []
 binaries = []

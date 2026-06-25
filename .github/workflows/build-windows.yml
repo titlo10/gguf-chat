@@ -63,3 +63,15 @@ jobs:
           name: GGUFChat-windows
           path: dist/GGUFChat
           retention-days: 30
+
+      - name: Диагностическая сборка (консоль + GGUF_DEBUG)
+        env:
+          GGUF_CONSOLE: "1"
+          GGUF_APP_NAME: "GGUFChat-debug"
+        run: pyinstaller gguf-ui.spec --noconfirm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GGUFChat-windows-debug
+          path: dist/GGUFChat-debug
+          retention-days: 30
