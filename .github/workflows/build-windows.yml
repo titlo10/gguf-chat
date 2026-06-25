@@ -16,7 +16,7 @@ jobs:
           python-version: '3.12'
 
       - name: Обновить pip и поставить инструменты сборки
-        run: python -m pip install --upgrade pip pyinstaller ninja pypdf python-docx
+        run: python -m pip install --upgrade pip pyinstaller ninja pypdf python-docx diskcache jinja2
 
       - name: Бэкенд Vulkan (готовое колесо, для CPU с AVX2)
         run: >

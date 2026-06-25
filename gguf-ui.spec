@@ -6,7 +6,7 @@ APP_NAME = "GGUFChat"
 
 datas = []
 binaries = []
-hiddenimports = ["pypdf", "docx"]
+hiddenimports = ["pypdf", "docx", "diskcache", "jinja2"]
 
 try:
     from PyInstaller.utils.hooks import collect_data_files
