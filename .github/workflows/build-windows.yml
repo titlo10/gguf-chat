@@ -30,16 +30,21 @@ jobs:
           Write-Host "=== Ассеты релиза ==="
           $rel.assets | ForEach-Object { Write-Host ("- {0}" -f $_.name) }
 
-          $cuda = $rel.assets | Where-Object { $_.name -match '(?i)win.*cuda.*x64.*\.zip$' }
-          $cuda = ($cuda | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cuda | Select-Object -First 1)
-          $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart.*win.*\.zip$' }
-          $cudart = ($cudart | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cudart | Select-Object -First 1)
+          $cuda = $rel.assets |
+            Where-Object { $_.name -match '(?i)bin-win-cuda-.*x64.*\.zip$' -and $_.name -notmatch '(?i)cudart' } |
+            Sort-Object name -Descending | Select-Object -First 1
+          if (-not $cuda) { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name) — см. список ассетов выше" }
 
-          if (-not $cuda)   { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name) — см. список ассетов выше" }
+          $ver = ([regex]::Match($cuda.name, '(?i)cuda-(\d+\.\d+)')).Groups[1].Value
+          $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart' -and $_.name -match [regex]::Escape($ver) } | Select-Object -First 1
+          if (-not $cudart) {
+            $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart' } | Sort-Object name -Descending | Select-Object -First 1
+          }
           if (-not $cudart) { throw "Не найден ассет cudart в релизе $($rel.tag_name) — см. список ассетов выше" }
+
           Write-Host "Релиз: $($rel.tag_name)"
           Write-Host "CUDA:   $($cuda.name)"
-          Write-Host "cudart: $($cudart.name)"
+          Write-Host "cudart: $($cudart.name)  (версия $ver)"
 
           Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile cuda.zip
           Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile cudart.zip
