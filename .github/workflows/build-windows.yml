@@ -38,18 +38,26 @@ jobs:
           Write-Host "CUDA:   $($cuda.name)"
           Write-Host "cudart: $($cudart.name)"
 
-          New-Item -ItemType Directory -Force build/llama_server | Out-Null
           Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile cuda.zip
           Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile cudart.zip
-          Expand-Archive cuda.zip   -DestinationPath build/llama_server -Force
-          Expand-Archive cudart.zip -DestinationPath build/llama_server -Force
+          Remove-Item -Recurse -Force staging, build/llama_server -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force staging | Out-Null
+          New-Item -ItemType Directory -Force build/llama_server | Out-Null
+          Expand-Archive cuda.zip   -DestinationPath staging -Force
+          Expand-Archive cudart.zip -DestinationPath staging -Force
+          Get-ChildItem -Path staging -Recurse -File | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path "build/llama_server" $_.Name) -Force
+          }
+          Write-Host "Содержимое build/llama_server:"
+          Get-ChildItem build/llama_server | Select-Object -ExpandProperty Name
 
       - name: Проверить, что движок на месте
         shell: pwsh
         run: |
           if (!(Test-Path build/llama_server/llama-server.exe)) {
-            Get-ChildItem -Recurse build/llama_server | Select-Object FullName
-            throw "Нет llama-server.exe"
+            Write-Host "=== staging ==="; Get-ChildItem -Recurse staging | Select-Object FullName
+            Write-Host "=== build/llama_server ==="; Get-ChildItem -Recurse build/llama_server | Select-Object FullName
+            throw "Нет llama-server.exe — структура архива неожиданная (см. листинг)"
           }
           Write-Host "llama-server.exe на месте."
 
