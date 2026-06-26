@@ -11,7 +11,14 @@ import traceback
 import faulthandler
 import subprocess
 
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+for _k in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_k, "1")
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
@@ -235,8 +242,28 @@ class Attempt:
         self.n_gpu_layers = n_gpu_layers
 
 
+def _prewarm_backend_threadlib():
+    base = bundle_dir()
+    cpu = os.path.join(base, "llama_cpp_cpu")
+    if not os.path.isdir(os.path.join(cpu, "llama_cpp")):
+        return
+    sys.path.insert(0, cpu)
+    dbg("worker: pre-warm path=%s" % cpu)
+    try:
+        import numpy  # noqa: F401
+        dbg("worker: pre-warm numpy OK (%s)" % getattr(numpy, "__version__", "?"))
+    except Exception as exc:
+        dbg("worker: pre-warm numpy failed: " + repr(exc))
+    finally:
+        try:
+            sys.path.remove(cpu)
+        except ValueError:
+            pass
+
+
 def worker_main():
     try:
+        _prewarm_backend_threadlib()
         _run_worker()
     except Exception:
         try:
@@ -260,6 +287,12 @@ def _run_worker():
     cmds = queue.Queue()
     cancel = threading.Event()
 
+    backends = BackendManager()
+    state = {"llm": None}
+    dbg("worker ready")
+    if DEBUG:
+        faulthandler.enable()
+
     def reader():
         try:
             for line in stdin:
@@ -279,12 +312,6 @@ def _run_worker():
         cmds.put({"cmd": "quit"})
 
     threading.Thread(target=reader, daemon=True).start()
-
-    backends = BackendManager()
-    state = {"llm": None}
-    dbg("worker ready")
-    if DEBUG:
-        faulthandler.enable()
 
     while True:
         msg = cmds.get()
@@ -391,14 +418,21 @@ class LlmEngine:
 
     def _new_worker(self):
         win = sys.platform.startswith("win")
+        thread_env = {
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "OPENMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        }
         if DEBUG:
             flags = 0
             werr = None
-            wenv = {**os.environ, "GGUF_DEBUG": "1"}
+            wenv = {**os.environ, **thread_env, "GGUF_DEBUG": "1"}
         else:
             flags = CREATE_NO_WINDOW if win else 0
             werr = subprocess.DEVNULL
-            wenv = None
+            wenv = {**os.environ, **thread_env}
         proc = subprocess.Popen(
             self._worker_argv(),
             stdin=subprocess.PIPE,
