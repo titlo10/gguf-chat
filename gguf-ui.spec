@@ -6,7 +6,7 @@ APP_NAME = os.environ.get("GGUF_APP_NAME", "GGUFChat")
 
 datas = []
 binaries = []
-hiddenimports = ["pypdf", "docx", "diskcache", "jinja2"]
+hiddenimports = ["pypdf", "docx"]
 
 try:
     from PyInstaller.utils.hooks import collect_data_files
@@ -14,20 +14,9 @@ try:
 except Exception:
     pass
 
-if IS_WIN:
-    datas += [
-        (os.path.join("build", "llama_vulkan"), "llama_vulkan"),
-        (os.path.join("build", "llama_cpu"), "llama_cpp_cpu"),
-    ]
-    _vk = os.path.join("redist", "vulkan-1.dll")
-    if os.path.isfile(_vk):
-        datas += [(_vk, os.path.join("llama_vulkan", "llama_cpp", "lib"))]
-else:
-    from PyInstaller.utils.hooks import collect_all
-    _d, _b, _h = collect_all("llama_cpp")
-    datas += _d
-    binaries += _b
-    hiddenimports += _h
+_srv = os.path.join("build", "llama_server")
+if os.path.isdir(_srv):
+    datas += [(_srv, "llama_server")]
 
 a = Analysis(
     ["app.py"],
@@ -35,7 +24,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=["hooks"],
+    hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],

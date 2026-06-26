@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 import enum
 import json
+import time
 import queue
-import importlib
+import socket
 import threading
 import traceback
-import faulthandler
 import subprocess
-
-for _k in (
-    "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "OPENMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-):
-    os.environ.setdefault(_k, "1")
+import urllib.error
+import urllib.request
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
@@ -27,6 +19,7 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 APP_TITLE = "GGUF Чат"
 SHIFT_MASK = 0x0001
 CREATE_NO_WINDOW = 0x08000000
+SERVER_HOST = "127.0.0.1"
 
 
 def _console_attached() -> bool:
@@ -41,8 +34,7 @@ def _console_attached() -> bool:
 
 DEBUG = bool(os.environ.get("GGUF_DEBUG")) or _console_attached()
 
-META_TIMEOUT = 30.0 if DEBUG else 60.0
-LOAD_TIMEOUT = 120.0 if DEBUG else 300.0
+LOAD_TIMEOUT = 300.0
 GEN_TIMEOUT = 600.0
 
 
@@ -63,12 +55,6 @@ class Msg(enum.Enum):
     LOADED = enum.auto()
     ERROR = enum.auto()
     FATAL = enum.auto()
-
-
-class Backend(enum.Enum):
-    VULKAN = enum.auto()
-    CPU = enum.auto()
-    DEFAULT = enum.auto()
 
 
 class Tag(enum.StrEnum):
@@ -92,21 +78,6 @@ def app_dir() -> str:
 
 def bundle_dir() -> str:
     return getattr(sys, "_MEIPASS", None) or app_dir()
-
-
-def log_path() -> str:
-    return os.path.join(app_dir(), "gguf-chat.log")
-
-
-def cpu_has_avx2() -> bool:
-    try:
-        if sys.platform.startswith("win"):
-            import ctypes
-            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
-        with open("/proc/cpuinfo", "r") as f:
-            return re.search(r"\bavx2\b", f.read()) is not None
-    except Exception:
-        return False
 
 
 def find_gguf_models(folder: str):
@@ -152,551 +123,199 @@ def extract_document_text(path):
     return _read_text_file(path)
 
 
-class NativeLog:
-    def __init__(self, path):
-        self.path = path
-        self.text = ""
-        self._ok = False
-        self._fh = None
-        self._saved = None
-        self._start = 0
-
-    def __enter__(self):
-        if DEBUG:
-            self._ok = False
-            return self
-        try:
-            self._fh = open(self.path, "a+b")
-            self._start = self._fh.seek(0, os.SEEK_END)
-            self._saved = os.dup(2)
-            os.dup2(self._fh.fileno(), 2)
-            self._ok = True
-        except Exception:
-            self._ok = False
-        return self
-
-    def __exit__(self, *exc):
-        if not self._ok:
-            return False
-        try:
-            os.dup2(self._saved, 2)
-            os.close(self._saved)
-            self._fh.seek(self._start)
-            self.text = self._fh.read().decode("utf-8", "replace")
-            self._fh.close()
-        except Exception:
-            pass
-        return False
-
-
-_OFFLOAD_RE = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers?\s+to\s+GPU", re.I)
-_LAYER_DEV_RE = re.compile(r"assigned to device\s+([A-Za-z0-9_]+)", re.I)
-
-
-def parse_offloaded(log_text: str):
-    text = log_text or ""
-    m = _OFFLOAD_RE.search(text)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    devices = _LAYER_DEV_RE.findall(text)
-    if not devices:
-        return None
-    gpu = sum(1 for d in devices if d.upper() != "CPU")
-    if gpu == 0:
-        return None
-    return gpu, len(devices)
-
-
-class BackendManager:
-    def __init__(self):
-        self._injected = []
-
-    def candidates(self):
-        base = bundle_dir()
-        out = []
-        vk = os.path.join(base, "llama_vulkan")
-        cpu = os.path.join(base, "llama_cpp_cpu")
-        if os.path.isdir(os.path.join(vk, "llama_cpp")):
-            out.append((Backend.VULKAN, vk))
-        if os.path.isdir(os.path.join(cpu, "llama_cpp")):
-            out.append((Backend.CPU, cpu))
-        if not out:
-            out.append((Backend.DEFAULT, None))
-        return out
-
-    def import_backend(self, path):
-        for name in [m for m in sys.modules if m == "llama_cpp" or m.startswith("llama_cpp.")]:
-            del sys.modules[name]
-        for p in self._injected:
-            try:
-                sys.path.remove(p)
-            except ValueError:
-                pass
-        self._injected.clear()
-        if path:
-            sys.path.insert(0, path)
-            self._injected.append(path)
-            lib = os.path.join(path, "llama_cpp", "lib")
-            if sys.platform.startswith("win") and os.path.isdir(lib):
-                try:
-                    os.add_dll_directory(lib)
-                except Exception:
-                    pass
-        importlib.invalidate_caches()
-        dbg("import_backend: import_module('llama_cpp') from %s" % path)
-        mod = importlib.import_module("llama_cpp")
-        dbg("import_backend: import_module done")
-        return mod
-
-
-class Attempt:
-    def __init__(self, label, path, n_gpu_layers):
-        self.label = label
-        self.path = path
-        self.n_gpu_layers = n_gpu_layers
-
-
-def _prewarm_backend_threadlib():
-    base = bundle_dir()
-    cpu = os.path.join(base, "llama_cpp_cpu")
-    if not os.path.isdir(os.path.join(cpu, "llama_cpp")):
-        return
-    sys.path.insert(0, cpu)
-    dbg("worker: pre-warm path=%s" % cpu)
-    try:
-        import numpy  # noqa: F401
-        dbg("worker: pre-warm numpy OK (%s)" % getattr(numpy, "__version__", "?"))
-    except Exception as exc:
-        dbg("worker: pre-warm numpy failed: " + repr(exc))
-    finally:
-        try:
-            sys.path.remove(cpu)
-        except ValueError:
-            pass
-
-
-def worker_main():
-    try:
-        _prewarm_backend_threadlib()
-        _run_worker()
-    except Exception:
-        try:
-            with open(log_path(), "a", encoding="utf-8") as f:
-                f.write("\n[worker fatal] " + traceback.format_exc() + "\n")
-        except Exception:
-            pass
-
-
-def _run_worker():
-    stdin = os.fdopen(0, "r", buffering=1, encoding="utf-8", newline="\n")
-    stdout = os.fdopen(1, "w", buffering=1, encoding="utf-8", newline="\n")
-
-    out_lock = threading.Lock()
-
-    def send(obj):
-        with out_lock:
-            stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            stdout.flush()
-
-    cmds = queue.Queue()
-    cancel = threading.Event()
-
-    backends = BackendManager()
-    state = {"llm": None}
-    dbg("worker ready")
-    if DEBUG:
-        faulthandler.enable()
-
-    def reader():
-        try:
-            for line in stdin:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except Exception:
-                    continue
-                if msg.get("cmd") == "cancel":
-                    cancel.set()
-                else:
-                    cmds.put(msg)
-        except Exception:
-            pass
-        cmds.put({"cmd": "quit"})
-
-    threading.Thread(target=reader, daemon=True).start()
-
-    while True:
-        msg = cmds.get()
-        cmd = msg.get("cmd")
-        if cmd == "quit":
-            break
-        elif cmd == "meta":
-            if DEBUG:
-                faulthandler.dump_traceback_later(25, repeat=True)
-            try:
-                dbg("meta: import backend " + str(msg.get("backend_path")))
-                lc = backends.import_backend(msg.get("backend_path"))
-                dbg("meta: vocab_only Llama")
-                m = lc.Llama(model_path=msg["model"], vocab_only=True, verbose=False)
-                n_layer = None
-                try:
-                    for k, v in dict(m.metadata).items():
-                        if k.endswith(".block_count"):
-                            n_layer = int(v)
-                            break
-                except Exception:
-                    pass
-                send({"ev": "meta", "n_layer": n_layer})
-            except Exception as exc:
-                dbg("meta: FAILED " + repr(exc))
-                send({"ev": "error", "msg": repr(exc)})
-            finally:
-                if DEBUG:
-                    faulthandler.cancel_dump_traceback_later()
-        elif cmd == "load":
-            if DEBUG:
-                faulthandler.dump_traceback_later(25, repeat=True)
-            try:
-                dbg("load: import backend " + str(msg.get("backend_path")))
-                lc = backends.import_backend(msg.get("backend_path"))
-                cap = NativeLog(log_path())
-                dbg("load: constructing Llama ngl=%s n_ctx=%s" % (msg.get("ngl"), msg.get("n_ctx")))
-                with cap:
-                    m = lc.Llama(
-                        model_path=msg["model"],
-                        n_ctx=int(msg["n_ctx"]),
-                        n_gpu_layers=int(msg["ngl"]),
-                        verbose=True,
-                    )
-                dbg("load: Llama constructed OK")
-                try:
-                    m.verbose = False
-                except Exception:
-                    pass
-                gpu_ok = False
-                try:
-                    gpu_ok = bool(lc.llama_supports_gpu_offload())
-                except Exception:
-                    pass
-                state["llm"] = m
-                dbg("load: sending loaded")
-                send({"ev": "loaded", "gpu_ok": gpu_ok, "offloaded": parse_offloaded(cap.text)})
-            except Exception as exc:
-                dbg("load: FAILED " + repr(exc))
-                send({"ev": "error", "msg": repr(exc)})
-            finally:
-                if DEBUG:
-                    faulthandler.cancel_dump_traceback_later()
-        elif cmd == "gen":
-            m = state["llm"]
-            if m is None:
-                send({"ev": "error", "msg": "Модель не загружена."})
-                continue
-            cancel.clear()
-            try:
-                stream = m.create_chat_completion(
-                    messages=msg["messages"], stream=True, **msg.get("params", {})
-                )
-                stopped = False
-                for chunk in stream:
-                    if cancel.is_set():
-                        stopped = True
-                        try:
-                            stream.close()
-                        except Exception:
-                            pass
-                        break
-                    piece = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
-                    if piece:
-                        send({"ev": "token", "t": piece})
-                send({"ev": "stopped" if stopped else "done"})
-            except Exception as exc:
-                send({"ev": "error", "msg": repr(exc)})
-
-
 class LlmEngine:
     def __init__(self):
-        self.backends = BackendManager()
         self.proc = None
-        self._q = None
+        self.port = None
         self.status = "Модель не загружена."
         self._loaded = False
-        self._wlock = threading.Lock()
+        self._stderr = []
+        self._cancel = threading.Event()
 
-    def _worker_argv(self):
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--worker"]
-        return [sys.executable, os.path.abspath(__file__), "--worker"]
-
-    def _new_worker(self):
-        win = sys.platform.startswith("win")
-        thread_env = {
-            "OPENBLAS_NUM_THREADS": "1",
-            "OMP_NUM_THREADS": "1",
-            "OPENMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
-        }
-        if DEBUG:
-            flags = 0
-            werr = None
-            wenv = {**os.environ, **thread_env, "GGUF_DEBUG": "1"}
-        else:
-            flags = CREATE_NO_WINDOW if win else 0
-            werr = subprocess.DEVNULL
-            wenv = {**os.environ, **thread_env}
-        proc = subprocess.Popen(
-            self._worker_argv(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=werr,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            creationflags=flags,
-            env=wenv,
-        )
-        dbg("spawned worker pid=%s" % proc.pid)
-        q = queue.Queue()
-
-        def pump():
-            try:
-                for line in proc.stdout:
-                    q.put(line)
-            except Exception:
-                pass
-            q.put(None)
-
-        threading.Thread(target=pump, daemon=True).start()
-        return proc, q
-
-    def _send(self, proc, obj):
-        with self._wlock:
-            proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            proc.stdin.flush()
+    def _server_exe(self):
+        base = bundle_dir()
+        for name in ("llama-server.exe", "llama-server"):
+            path = os.path.join(base, "llama_server", name)
+            if os.path.isfile(path):
+                return path
+        env = os.environ.get("LLAMA_SERVER")
+        if env and os.path.isfile(env):
+            return env
+        return None
 
     @staticmethod
-    def _next(q, timeout):
+    def _free_port():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            line = q.get(timeout=timeout)
-        except queue.Empty:
-            return "timeout", None
-        if line is None:
-            return "eof", None
-        return "line", line
+            s.bind((SERVER_HOST, 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
 
-    @staticmethod
-    def _kill(proc):
+    def _base_url(self):
+        return "http://%s:%d" % (SERVER_HOST, self.port)
+
+    def _drain_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                line = line.rstrip("\n")
+                self._stderr.append(line)
+                if len(self._stderr) > 400:
+                    del self._stderr[:200]
+                dbg("server: " + line)
+        except Exception:
+            pass
+
+    def _stderr_tail(self, n=8):
+        return "\n".join(self._stderr[-n:])
+
+    def _health_ok(self):
+        try:
+            with urllib.request.urlopen(self._base_url() + "/health", timeout=2) as r:
+                body = r.read().decode("utf-8", "replace")
+            return r.status == 200 and '"ok"' in body
+        except Exception:
+            return False
+
+    def is_loaded(self) -> bool:
+        return self._loaded and self.proc is not None and self.proc.poll() is None
+
+    def shutdown(self):
+        proc = self.proc
+        self.proc = None
+        self._loaded = False
         if proc is None:
             return
         try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        try:
             proc.terminate()
-            proc.wait(timeout=2)
+            proc.wait(timeout=5)
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                pass
 
-    def shutdown(self):
-        self._kill(self.proc)
-        self.proc = None
-        self._q = None
-        self._loaded = False
+    def _start(self, exe, model_path, n_ctx, ngl, log):
+        self.port = self._free_port()
+        self._stderr = []
+        argv = [
+            exe,
+            "-m", model_path,
+            "-c", str(int(n_ctx)),
+            "-ngl", str(int(ngl)),
+            "--host", SERVER_HOST,
+            "--port", str(self.port),
+        ]
+        win = sys.platform.startswith("win")
+        flags = CREATE_NO_WINDOW if (win and not DEBUG) else 0
+        dbg("server spawn: %s" % " ".join(argv))
+        self.proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=flags,
+        )
+        threading.Thread(target=self._drain_stderr, args=(self.proc,), daemon=True).start()
 
-    def _safe_probe_path(self):
-        cands = dict(self.backends.candidates())
-        if Backend.CPU in cands:
-            return cands[Backend.CPU]
-        if Backend.DEFAULT in cands:
-            return cands[Backend.DEFAULT]
-        if Backend.VULKAN in cands and cpu_has_avx2():
-            return cands[Backend.VULKAN]
-        return cands.get(Backend.VULKAN)
+        deadline = time.monotonic() + LOAD_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                return False, self._stderr_tail()
+            if self._health_ok():
+                return True, ""
+            time.sleep(0.4)
+        return False, "таймаут загрузки"
 
-    def _gpu_ladder(self, requested_ngl, n_layer):
-        if requested_ngl <= 0:
-            return []
-        if not n_layer:
-            return [requested_ngl]
-        top = n_layer if requested_ngl >= 900 else min(requested_ngl, n_layer)
-        steps = []
-        for frac in (1.0, 0.75, 0.5, 0.25):
-            v = max(1, int(round(top * frac)))
-            if v not in steps:
-                steps.append(v)
-        return steps
-
-    def _plan(self, requested_ngl, n_layer):
-        cands = dict(self.backends.candidates())
-        plan = []
-        if requested_ngl != 0:
-            if Backend.VULKAN in cands and cpu_has_avx2():
-                path, label = cands[Backend.VULKAN], "Vulkan GPU"
-            elif Backend.DEFAULT in cands:
-                path, label = cands[Backend.DEFAULT], "GPU"
-            else:
-                path, label = None, None
-            if label:
-                for v in self._gpu_ladder(requested_ngl, n_layer):
-                    plan.append(Attempt(f"{label} ({v} сл.)", path, v))
-        if Backend.CPU in cands:
-            plan.append(Attempt("CPU", cands[Backend.CPU], 0))
-        elif Backend.VULKAN in cands:
-            plan.append(Attempt("CPU (сборка vulkan)", cands[Backend.VULKAN], 0))
-        else:
-            plan.append(Attempt("CPU", cands.get(Backend.DEFAULT), 0))
-        return plan
-
-    def _probe_n_layer(self, model_path):
-        proc = None
-        try:
-            proc, q = self._new_worker()
-            self._send(proc, {"cmd": "meta", "backend_path": self._safe_probe_path(), "model": model_path})
-            while True:
-                kind, line = self._next(q, META_TIMEOUT)
-                if kind != "line":
-                    return None
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if ev.get("ev") == "meta":
-                    return ev.get("n_layer")
-                if ev.get("ev") == "error":
-                    return None
-        except Exception:
-            return None
-        finally:
-            self._kill(proc)
-
-    def _crash_hint(self):
-        try:
-            with open(log_path(), errors="replace") as f:
-                tail = [s.strip() for s in f.read().splitlines() if s.strip()][-3:]
-            joined = " | ".join(tail)
-            return "нативный сбой (нехватка VRAM/драйвер). " + joined[-200:]
-        except Exception:
-            return "нативный сбой (нехватка VRAM/драйвер)"
-
-    def _await_loaded(self, q):
-        while True:
-            kind, line = self._next(q, LOAD_TIMEOUT)
-            if kind == "eof":
-                dbg("worker EOF before load result (crashed)")
-                return {"ev": "error", "msg": self._crash_hint()}
-            if kind == "timeout":
-                dbg("LOAD_TIMEOUT %ss with no result" % LOAD_TIMEOUT)
-                return {"ev": "error", "msg": "таймаут загрузки (возможно, зависание драйвера)"}
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            if ev.get("ev") in ("loaded", "error"):
-                return ev
-
-    def _status_for(self, attempt, offloaded, gpu_ok):
-        if offloaded and offloaded[0] > 0:
-            return f"{attempt.label}: на GPU выгружено {offloaded[0]}/{offloaded[1]} слоёв"
-        if attempt.n_gpu_layers == 0:
-            return f"{attempt.label}: работает на CPU"
-        if gpu_ok:
-            return f"{attempt.label}: загружено (выгрузка на GPU запрошена)"
-        return f"{attempt.label}: работает на CPU (без выгрузки)"
+    def _status_from_log(self, ngl):
+        text = "\n".join(self._stderr).lower()
+        gpu = "ggml_cuda_init" in text or "using device cuda" in text or "cuda0" in text
+        if ngl == 0:
+            return "Работает на CPU"
+        if gpu:
+            return "Загружено на видеокарту (CUDA)"
+        return "Загружено (CPU — видеокарта не задействована)"
 
     def load(self, model_path: str, n_ctx: int, requested_ngl: int, on_log=None):
         def log(msg):
             if on_log:
                 on_log(msg)
 
-        try:
-            open(log_path(), "w").close()
-        except Exception:
-            pass
-
         self.shutdown()
+        exe = self._server_exe()
+        if not exe:
+            raise RuntimeError("Не найден llama-server (папка llama_server рядом с программой).")
 
-        n_layer = None
-        if requested_ngl != 0:
-            log("Определяю число слоёв модели …")
-            n_layer = self._probe_n_layer(model_path)
-
-        errors = []
-        for attempt in self._plan(requested_ngl, n_layer):
-            log(f"Пробую: {attempt.label} …")
-            dbg("attempt: %s backend=%s ngl=%s" % (attempt.label, attempt.path, attempt.n_gpu_layers))
-            proc, q = self._new_worker()
-            try:
-                self._send(proc, {
-                    "cmd": "load",
-                    "backend_path": attempt.path,
-                    "model": model_path,
-                    "n_ctx": int(n_ctx),
-                    "ngl": int(attempt.n_gpu_layers),
-                })
-                ev = self._await_loaded(q)
-            except Exception as exc:
-                ev = {"ev": "error", "msg": str(exc)}
-
-            dbg("attempt result: %s %s" % (ev.get("ev"), (ev.get("msg") or "")[:300]))
-            if ev.get("ev") == "loaded":
-                self.proc = proc
-                self._q = q
+        req = 999 if int(requested_ngl) >= 900 else int(requested_ngl)
+        attempts = [req] if req == 0 else [req, 0]
+        last = ""
+        for ngl in attempts:
+            log("Запускаю движок (слоёв на GPU: %s) …" % ngl)
+            ok, err = self._start(exe, model_path, n_ctx, ngl, log)
+            if ok:
                 self._loaded = True
-                self.status = self._status_for(attempt, ev.get("offloaded"), ev.get("gpu_ok"))
+                self.status = self._status_from_log(ngl)
                 log(self.status)
                 return self.status
+            last = err
+            self.shutdown()
+            if ngl != attempts[-1]:
+                log("Не вышло, пробую запасной вариант (CPU) …")
 
-            reason = (ev.get("msg") or "").splitlines()[0] if ev.get("msg") else "не удалось"
-            errors.append(f"{attempt.label}: {reason}")
-            log(f"{attempt.label}: не вышло — пробую дальше")
-            self._kill(proc)
-
-        raise RuntimeError("Не удалось загрузить модель ни одним способом.\n\n" + "\n".join(errors))
-
-    def is_loaded(self) -> bool:
-        return self._loaded and self.proc is not None
+        raise RuntimeError("Не удалось загрузить модель.\n\n" + (last or "неизвестная ошибка"))
 
     def cancel(self):
-        if self.proc is not None:
-            try:
-                self._send(self.proc, {"cmd": "cancel"})
-            except Exception:
-                pass
+        self._cancel.set()
 
     def stream_chat(self, messages, **params):
-        proc, q = self.proc, self._q
-        if proc is None or q is None or not self._loaded:
+        if not self.is_loaded():
             raise RuntimeError("Модель не загружена.")
-        self._send(proc, {"cmd": "gen", "messages": messages, "params": params})
-        while True:
-            kind, line = self._next(q, GEN_TIMEOUT)
-            if kind == "eof":
-                self._loaded = False
-                raise RuntimeError("процесс генерации аварийно завершился")
-            if kind == "timeout":
-                raise RuntimeError("таймаут генерации")
+        self._cancel.clear()
+
+        payload = {"messages": messages, "stream": True}
+        for key in ("temperature", "top_p", "top_k", "max_tokens", "seed", "repeat_penalty"):
+            if params.get(key) is not None:
+                payload[key] = params[key]
+
+        req = urllib.request.Request(
+            self._base_url() + "/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=GEN_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError("ошибка движка: " + detail[:300])
+        except Exception as exc:
+            raise RuntimeError("движок недоступен: " + str(exc))
+
+        try:
+            for raw in resp:
+                if self._cancel.is_set():
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except Exception:
+                    continue
+                delta = obj.get("choices", [{}])[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+        finally:
             try:
-                ev = json.loads(line)
+                resp.close()
             except Exception:
-                continue
-            kind = ev.get("ev")
-            if kind == "token":
-                yield ev.get("t", "")
-            elif kind in ("done", "stopped"):
-                return
-            elif kind == "error":
-                raise RuntimeError(ev.get("msg", "ошибка генерации"))
+                pass
 
 
 class ChatApp(tk.Tk):
@@ -1058,9 +677,6 @@ class ChatApp(tk.Tk):
 
 
 def main():
-    if "--worker" in sys.argv[1:]:
-        worker_main()
-        return
     dbg("GUI start; DEBUG=%s platform=%s" % (DEBUG, sys.platform))
     ChatApp().mainloop()
 

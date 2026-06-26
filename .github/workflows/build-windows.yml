@@ -15,56 +15,43 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Обновить pip и поставить инструменты сборки
-        run: python -m pip install --upgrade pip pyinstaller ninja pypdf python-docx diskcache jinja2
+      - name: Поставить инструменты сборки
+        run: python -m pip install --upgrade pip pyinstaller pypdf python-docx
 
-      - name: Бэкенд Vulkan (готовое колесо, для CPU с AVX2)
-        run: >
-          pip install --target build/llama_vulkan
-          "llama-cpp-python==0.3.30"
-          --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
+      - name: Скачать официальный llama.cpp (CUDA) + CUDA runtime
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gguf-ui-ci" } `
+                 -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
-      - name: Положить загрузчик vulkan-1.dll рядом с ggml-vulkan.dll
+          $cuda = $rel.assets | Where-Object { $_.name -match 'bin-win-cuda.*x64\.zip$' }
+          $cuda = ($cuda | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cuda | Select-Object -First 1)
+          $cudart = $rel.assets | Where-Object { $_.name -match 'cudart.*win.*x64\.zip$' }
+          $cudart = ($cudart | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cudart | Select-Object -First 1)
+
+          if (-not $cuda)   { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name)" }
+          if (-not $cudart) { throw "Не найден ассет cudart в релизе $($rel.tag_name)" }
+          Write-Host "Релиз: $($rel.tag_name)"
+          Write-Host "CUDA:   $($cuda.name)"
+          Write-Host "cudart: $($cudart.name)"
+
+          New-Item -ItemType Directory -Force build/llama_server | Out-Null
+          Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile cuda.zip
+          Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile cudart.zip
+          Expand-Archive cuda.zip   -DestinationPath build/llama_server -Force
+          Expand-Archive cudart.zip -DestinationPath build/llama_server -Force
+
+      - name: Проверить, что движок на месте
         shell: pwsh
         run: |
-          $lib = "build/llama_vulkan/llama_cpp/lib"
-          $dst = Join-Path $lib "vulkan-1.dll"
-          $sys = Join-Path $env:WINDIR "System32/vulkan-1.dll"
-          if (Test-Path "redist/vulkan-1.dll") {
-            Copy-Item "redist/vulkan-1.dll" $dst -Force
-          } elseif (Test-Path $sys) {
-            Copy-Item $sys $dst -Force
-          } else {
-            throw "Не найден vulkan-1.dll — положи его в redist/vulkan-1.dll"
+          if (!(Test-Path build/llama_server/llama-server.exe)) {
+            Get-ChildItem -Recurse build/llama_server | Select-Object FullName
+            throw "Нет llama-server.exe"
           }
-          Write-Host "vulkan-1.dll -> $dst"
-
-      - name: Бэкенд CPU из исходников БЕЗ AVX2 (для старых CPU)
-        env:
-          CMAKE_ARGS: "-DGGML_VULKAN=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_OPENMP=OFF"
-          FORCE_CMAKE: "1"
-        run: >
-          pip install --target build/llama_cpu
-          "llama-cpp-python==0.3.30"
-          --no-binary llama-cpp-python --no-cache-dir
-
-      - name: Проверить, что оба бэкенда собраны
-        shell: pwsh
-        run: |
-          $vk  = "build/llama_vulkan/llama_cpp/lib/ggml-vulkan.dll"
-          $vkl = "build/llama_vulkan/llama_cpp/lib/vulkan-1.dll"
-          $cpu = "build/llama_cpu/llama_cpp/lib/ggml-cpu.dll"
-          if (!(Test-Path $vk))  { Get-ChildItem build/llama_vulkan/llama_cpp/lib; throw "Нет $vk" }
-          if (!(Test-Path $vkl)) { Get-ChildItem build/llama_vulkan/llama_cpp/lib; throw "Нет $vkl" }
-          if (!(Test-Path $cpu)) { Get-ChildItem build/llama_cpu/llama_cpp/lib;   throw "Нет $cpu" }
-          Write-Host "Оба бэкенда на месте."
-
-      - name: Проверить, что ggml-vulkan.dll реально загружается
-        shell: pwsh
-        env:
-          VK_LIB: build/llama_vulkan/llama_cpp/lib
-        run: |
-          python -c "import os, ctypes; lib=os.path.abspath(os.environ['VK_LIB']); os.add_dll_directory(lib); ctypes.CDLL(os.path.join(lib,'ggml-base.dll')); ctypes.CDLL(os.path.join(lib,'ggml-vulkan.dll')); print('ggml-vulkan.dll OK')"
+          Write-Host "llama-server.exe на месте."
 
       - name: Сборка (PyInstaller onedir)
         run: pyinstaller gguf-ui.spec --noconfirm
@@ -73,14 +60,7 @@ jobs:
         shell: pwsh
         run: |
           $root = "dist/GGUFChat/_internal"
-          if (!(Test-Path "$root/llama_vulkan/llama_cpp/lib/ggml-vulkan.dll")) { throw "В сборке нет бэкенда Vulkan" }
-          if (!(Test-Path "$root/llama_vulkan/llama_cpp/lib/vulkan-1.dll"))    { throw "В сборке нет загрузчика vulkan-1.dll" }
-          if (!(Test-Path "$root/llama_cpp_cpu/llama_cpp/lib/ggml-cpu.dll"))   { throw "В сборке нет бэкенда CPU" }
-          foreach ($b in @("llama_vulkan", "llama_cpp_cpu")) {
-            foreach ($dep in @("diskcache", "numpy", "jinja2")) {
-              if (!(Test-Path "$root/$b/$dep")) { throw "В бэкенде $b нет зависимости $dep" }
-            }
-          }
+          if (!(Test-Path "$root/llama_server/llama-server.exe")) { throw "В сборке нет llama-server.exe" }
           Write-Host "Сборка в порядке."
 
       - uses: actions/upload-artifact@v4
