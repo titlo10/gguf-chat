@@ -40,16 +40,33 @@ jobs:
 
           Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile cuda.zip
           Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile cudart.zip
+
           Remove-Item -Recurse -Force staging, build/llama_server -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force staging | Out-Null
+          New-Item -ItemType Directory -Force staging/cuda | Out-Null
+          New-Item -ItemType Directory -Force staging/cudart | Out-Null
           New-Item -ItemType Directory -Force build/llama_server | Out-Null
-          Expand-Archive cuda.zip   -DestinationPath staging -Force
-          Expand-Archive cudart.zip -DestinationPath staging -Force
-          Get-ChildItem -Path staging -Recurse -File | ForEach-Object {
-            Copy-Item $_.FullName -Destination (Join-Path "build/llama_server" $_.Name) -Force
+
+          Expand-Archive cuda.zip   -DestinationPath staging/cuda  -Force
+          Expand-Archive cudart.zip -DestinationPath staging/cudart -Force
+
+          $exe = Get-ChildItem -Path staging -Recurse -Filter 'llama-server.exe' -File | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "=== staging/cuda ==="; Get-ChildItem -Recurse staging/cuda | Select-Object FullName
+            Write-Host "=== staging/cudart ==="; Get-ChildItem -Recurse staging/cudart | Select-Object FullName
+            throw "Не найден llama-server.exe в распакованных архивах (см. листинг)"
           }
+
+          Write-Host "Найден llama-server.exe: $($exe.FullName)"
+          $exeDir = $exe.Directory.FullName
+          Copy-Item -Path (Join-Path $exeDir '*') -Destination build/llama_server -Recurse -Force
+
+          Get-ChildItem -Path staging/cudart -Recurse -Filter '*.dll' -File | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path (Resolve-Path build/llama_server).Path $_.Name) -Force
+          }
+
           Write-Host "Содержимое build/llama_server:"
-          Get-ChildItem build/llama_server | Select-Object -ExpandProperty Name
+          Get-ChildItem build/llama_server -Recurse | Select-Object FullName
 
       - name: Проверить, что движок на месте
         shell: pwsh
