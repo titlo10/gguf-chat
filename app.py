@@ -190,13 +190,21 @@ class NativeLog:
 
 
 _OFFLOAD_RE = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers?\s+to\s+GPU", re.I)
+_LAYER_DEV_RE = re.compile(r"assigned to device\s+([A-Za-z0-9_]+)", re.I)
 
 
 def parse_offloaded(log_text: str):
-    m = _OFFLOAD_RE.search(log_text or "")
-    if not m:
+    text = log_text or ""
+    m = _OFFLOAD_RE.search(text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    devices = _LAYER_DEV_RE.findall(text)
+    if not devices:
         return None
-    return int(m.group(1)), int(m.group(2))
+    gpu = sum(1 for d in devices if d.upper() != "CPU")
+    if gpu == 0:
+        return None
+    return gpu, len(devices)
 
 
 class BackendManager:
@@ -228,6 +236,12 @@ class BackendManager:
         if path:
             sys.path.insert(0, path)
             self._injected.append(path)
+            lib = os.path.join(path, "llama_cpp", "lib")
+            if sys.platform.startswith("win") and os.path.isdir(lib):
+                try:
+                    os.add_dll_directory(lib)
+                except Exception:
+                    pass
         importlib.invalidate_caches()
         dbg("import_backend: import_module('llama_cpp') from %s" % path)
         mod = importlib.import_module("llama_cpp")

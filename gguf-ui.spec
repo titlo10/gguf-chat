@@ -21,7 +21,7 @@ if IS_WIN:
     ]
     _vk = os.path.join("redist", "vulkan-1.dll")
     if os.path.isfile(_vk):
-        binaries += [(_vk, ".")]
+        datas += [(_vk, os.path.join("llama_vulkan", "llama_cpp", "lib"))]
 else:
     from PyInstaller.utils.hooks import collect_all
     _d, _b, _h = collect_all("llama_cpp")

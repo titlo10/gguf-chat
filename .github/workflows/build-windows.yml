@@ -24,6 +24,21 @@ jobs:
           "llama-cpp-python==0.3.30"
           --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
 
+      - name: Положить загрузчик vulkan-1.dll рядом с ggml-vulkan.dll
+        shell: pwsh
+        run: |
+          $lib = "build/llama_vulkan/llama_cpp/lib"
+          $dst = Join-Path $lib "vulkan-1.dll"
+          $sys = Join-Path $env:WINDIR "System32/vulkan-1.dll"
+          if (Test-Path "redist/vulkan-1.dll") {
+            Copy-Item "redist/vulkan-1.dll" $dst -Force
+          } elseif (Test-Path $sys) {
+            Copy-Item $sys $dst -Force
+          } else {
+            throw "Не найден vulkan-1.dll — положи его в redist/vulkan-1.dll"
+          }
+          Write-Host "vulkan-1.dll -> $dst"
+
       - name: Бэкенд CPU из исходников БЕЗ AVX2 (для старых CPU)
         env:
           CMAKE_ARGS: "-DGGML_VULKAN=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_OPENMP=OFF"
@@ -37,10 +52,19 @@ jobs:
         shell: pwsh
         run: |
           $vk  = "build/llama_vulkan/llama_cpp/lib/ggml-vulkan.dll"
+          $vkl = "build/llama_vulkan/llama_cpp/lib/vulkan-1.dll"
           $cpu = "build/llama_cpu/llama_cpp/lib/ggml-cpu.dll"
           if (!(Test-Path $vk))  { Get-ChildItem build/llama_vulkan/llama_cpp/lib; throw "Нет $vk" }
+          if (!(Test-Path $vkl)) { Get-ChildItem build/llama_vulkan/llama_cpp/lib; throw "Нет $vkl" }
           if (!(Test-Path $cpu)) { Get-ChildItem build/llama_cpu/llama_cpp/lib;   throw "Нет $cpu" }
           Write-Host "Оба бэкенда на месте."
+
+      - name: Проверить, что ggml-vulkan.dll реально загружается
+        shell: pwsh
+        env:
+          VK_LIB: build/llama_vulkan/llama_cpp/lib
+        run: |
+          python -c "import os, ctypes; lib=os.path.abspath(os.environ['VK_LIB']); os.add_dll_directory(lib); ctypes.CDLL(os.path.join(lib,'ggml-base.dll')); ctypes.CDLL(os.path.join(lib,'ggml-vulkan.dll')); print('ggml-vulkan.dll OK')"
 
       - name: Сборка (PyInstaller onedir)
         run: pyinstaller gguf-ui.spec --noconfirm
@@ -50,6 +74,7 @@ jobs:
         run: |
           $root = "dist/GGUFChat/_internal"
           if (!(Test-Path "$root/llama_vulkan/llama_cpp/lib/ggml-vulkan.dll")) { throw "В сборке нет бэкенда Vulkan" }
+          if (!(Test-Path "$root/llama_vulkan/llama_cpp/lib/vulkan-1.dll"))    { throw "В сборке нет загрузчика vulkan-1.dll" }
           if (!(Test-Path "$root/llama_cpp_cpu/llama_cpp/lib/ggml-cpu.dll"))   { throw "В сборке нет бэкенда CPU" }
           foreach ($b in @("llama_vulkan", "llama_cpp_cpu")) {
             foreach ($dep in @("diskcache", "numpy", "jinja2")) {
