@@ -27,13 +27,16 @@ jobs:
           $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gguf-ui-ci" } `
                  -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
-          $cuda = $rel.assets | Where-Object { $_.name -match 'bin-win-cuda.*x64\.zip$' }
+          Write-Host "=== Ассеты релиза ==="
+          $rel.assets | ForEach-Object { Write-Host ("- {0}" -f $_.name) }
+
+          $cuda = $rel.assets | Where-Object { $_.name -match '(?i)win.*cuda.*x64.*\.zip$' }
           $cuda = ($cuda | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cuda | Select-Object -First 1)
-          $cudart = $rel.assets | Where-Object { $_.name -match 'cudart.*win.*x64\.zip$' }
+          $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart.*win.*\.zip$' }
           $cudart = ($cudart | Where-Object { $_.name -match '12' } | Select-Object -First 1) ?? ($cudart | Select-Object -First 1)
 
-          if (-not $cuda)   { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name)" }
-          if (-not $cudart) { throw "Не найден ассет cudart в релизе $($rel.tag_name)" }
+          if (-not $cuda)   { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name) — см. список ассетов выше" }
+          if (-not $cudart) { throw "Не найден ассет cudart в релизе $($rel.tag_name) — см. список ассетов выше" }
           Write-Host "Релиз: $($rel.tag_name)"
           Write-Host "CUDA:   $($cuda.name)"
           Write-Host "cudart: $($cudart.name)"
@@ -50,14 +53,15 @@ jobs:
           Expand-Archive cuda.zip   -DestinationPath staging/cuda  -Force
           Expand-Archive cudart.zip -DestinationPath staging/cudart -Force
 
-          $exe = Get-ChildItem -Path staging -Recurse -Filter 'llama-server.exe' -File | Select-Object -First 1
+          $exe = Get-ChildItem -Path staging -Recurse -File | Where-Object {
+            $_.Name -match '(?i)llama(-|_)server\.exe$' -or $_.Name -match '(?i)^server\.exe$'
+          } | Select-Object -First 1
           if (-not $exe) {
-            Write-Host "=== staging/cuda ==="; Get-ChildItem -Recurse staging/cuda | Select-Object FullName
-            Write-Host "=== staging/cudart ==="; Get-ChildItem -Recurse staging/cudart | Select-Object FullName
-            throw "Не найден llama-server.exe в распакованных архивах (см. листинг)"
+            Write-Host "=== staging tree ==="; Get-ChildItem -Recurse staging | Select-Object FullName
+            throw "Не найден исполняемый файл сервера (llama-server.exe / server.exe) — см. листинг"
           }
 
-          Write-Host "Найден llama-server.exe: $($exe.FullName)"
+          Write-Host "Найден сервер: $($exe.FullName)"
           $exeDir = $exe.Directory.FullName
           Copy-Item -Path (Join-Path $exeDir '*') -Destination build/llama_server -Recurse -Force
 
@@ -71,12 +75,14 @@ jobs:
       - name: Проверить, что движок на месте
         shell: pwsh
         run: |
-          if (!(Test-Path build/llama_server/llama-server.exe)) {
-            Write-Host "=== staging ==="; Get-ChildItem -Recurse staging | Select-Object FullName
+          $found = Get-ChildItem -Path build/llama_server -Recurse -File | Where-Object {
+            $_.Name -match '(?i)llama(-|_)server\.exe$' -or $_.Name -match '(?i)^server\.exe$'
+          } | Select-Object -First 1
+          if (-not $found) {
             Write-Host "=== build/llama_server ==="; Get-ChildItem -Recurse build/llama_server | Select-Object FullName
-            throw "Нет llama-server.exe — структура архива неожиданная (см. листинг)"
+            throw "Нет сервера в build/llama_server (см. листинг)"
           }
-          Write-Host "llama-server.exe на месте."
+          Write-Host "Движок на месте: $($found.FullName)"
 
       - name: Сборка (PyInstaller onedir)
         run: pyinstaller gguf-ui.spec --noconfirm

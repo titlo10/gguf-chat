@@ -134,7 +134,7 @@ class LlmEngine:
 
     def _server_exe(self):
         base = bundle_dir()
-        for name in ("llama-server.exe", "llama-server"):
+        for name in ("llama-server.exe", "llama-server", "server.exe", "server"):
             path = os.path.join(base, "llama_server", name)
             if os.path.isfile(path):
                 return path
