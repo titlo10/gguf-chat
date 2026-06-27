@@ -1,13 +1,14 @@
-name: build-windows-exe
+name: build-windows-zip
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PY_EMBED: "3.12.7"
+      PKG: dist/GGUFChat
     steps:
       - uses: actions/checkout@v4
 
@@ -15,104 +16,74 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Поставить инструменты сборки
-        run: python -m pip install --upgrade pip pyinstaller pypdf python-docx
-
-      - name: Скачать официальный llama.cpp (CUDA) + CUDA runtime
+      - name: Зависимости в libs (офлайн)
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gguf-ui-ci" } `
+          New-Item -ItemType Directory -Force "$env:PKG" | Out-Null
+          python -m pip install --upgrade pip
+          python -m pip install --target "$env:PKG/libs" -r requirements.txt
+
+      - name: Вложить код
+        shell: pwsh
+        run: Copy-Item app.py, engine.py, documents.py, constants.py "$env:PKG/"
+
+      - name: Встроить переносимый Python
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.python.org/ftp/python/$env:PY_EMBED/python-$env:PY_EMBED-embed-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile py.zip
+          Expand-Archive py.zip -DestinationPath "$env:PKG" -Force
+          $pth = (Get-ChildItem "$env:PKG" -Filter "python*._pth" | Select-Object -First 1).FullName
+          Set-Content $pth @('python312.zip', '.', 'libs', 'import site')
+
+      - name: Скачать llama-server (CUDA) + cudart
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $rel = Invoke-RestMethod -Headers @{ "User-Agent" = "gguf-ui" } `
                  -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-
-          Write-Host "=== Ассеты релиза ==="
-          $rel.assets | ForEach-Object { Write-Host ("- {0}" -f $_.name) }
-
           $cuda = $rel.assets |
             Where-Object { $_.name -match '(?i)bin-win-cuda-.*x64.*\.zip$' -and $_.name -notmatch '(?i)cudart' } |
             Sort-Object name -Descending | Select-Object -First 1
-          if (-not $cuda) { throw "Не найден ассет llama.cpp CUDA в релизе $($rel.tag_name) — см. список ассетов выше" }
-
+          if (-not $cuda) { throw "Не найден ассет CUDA в релизе $($rel.tag_name)" }
           $ver = ([regex]::Match($cuda.name, '(?i)cuda-(\d+\.\d+)')).Groups[1].Value
           $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart' -and $_.name -match [regex]::Escape($ver) } | Select-Object -First 1
-          if (-not $cudart) {
-            $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart' } | Sort-Object name -Descending | Select-Object -First 1
-          }
-          if (-not $cudart) { throw "Не найден ассет cudart в релизе $($rel.tag_name) — см. список ассетов выше" }
+          if (-not $cudart) { $cudart = $rel.assets | Where-Object { $_.name -match '(?i)cudart' } | Sort-Object name -Descending | Select-Object -First 1 }
+          Write-Host "Релиз $($rel.tag_name): $($cuda.name) + $($cudart.name)"
 
-          Write-Host "Релиз: $($rel.tag_name)"
-          Write-Host "CUDA:   $($cuda.name)"
-          Write-Host "cudart: $($cudart.name)  (версия $ver)"
+          New-Item -ItemType Directory -Force _dl, "$env:PKG/llama_server" | Out-Null
+          Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile _dl/cuda.zip
+          Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile _dl/cudart.zip
+          Expand-Archive _dl/cuda.zip   -DestinationPath _dl/cuda   -Force
+          Expand-Archive _dl/cudart.zip -DestinationPath _dl/cudart -Force
+          $exe = Get-ChildItem _dl/cuda -Recurse -File | Where-Object { $_.Name -match '(?i)llama-server\.exe$' } | Select-Object -First 1
+          if (-not $exe) { throw "llama-server.exe не найден" }
+          Copy-Item (Join-Path $exe.Directory.FullName '*') "$env:PKG/llama_server" -Recurse -Force
+          Get-ChildItem _dl/cudart -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName "$env:PKG/llama_server" -Force }
+          Remove-Item -Recurse -Force _dl
 
-          Invoke-WebRequest -Uri $cuda.browser_download_url   -OutFile cuda.zip
-          Invoke-WebRequest -Uri $cudart.browser_download_url -OutFile cudart.zip
-
-          Remove-Item -Recurse -Force staging, build/llama_server -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force staging | Out-Null
-          New-Item -ItemType Directory -Force staging/cuda | Out-Null
-          New-Item -ItemType Directory -Force staging/cudart | Out-Null
-          New-Item -ItemType Directory -Force build/llama_server | Out-Null
-
-          Expand-Archive cuda.zip   -DestinationPath staging/cuda  -Force
-          Expand-Archive cudart.zip -DestinationPath staging/cudart -Force
-
-          $exe = Get-ChildItem -Path staging -Recurse -File | Where-Object {
-            $_.Name -match '(?i)llama(-|_)server\.exe$' -or $_.Name -match '(?i)^server\.exe$'
-          } | Select-Object -First 1
-          if (-not $exe) {
-            Write-Host "=== staging tree ==="; Get-ChildItem -Recurse staging | Select-Object FullName
-            throw "Не найден исполняемый файл сервера (llama-server.exe / server.exe) — см. листинг"
-          }
-
-          Write-Host "Найден сервер: $($exe.FullName)"
-          $exeDir = $exe.Directory.FullName
-          Copy-Item -Path (Join-Path $exeDir '*') -Destination build/llama_server -Recurse -Force
-
-          Get-ChildItem -Path staging/cudart -Recurse -Filter '*.dll' -File | ForEach-Object {
-            Copy-Item $_.FullName -Destination (Join-Path (Resolve-Path build/llama_server).Path $_.Name) -Force
-          }
-
-          Write-Host "Содержимое build/llama_server:"
-          Get-ChildItem build/llama_server -Recurse | Select-Object FullName
-
-      - name: Проверить, что движок на месте
+      - name: Лаунчер start.bat
         shell: pwsh
-        run: |
-          $found = Get-ChildItem -Path build/llama_server -Recurse -File | Where-Object {
-            $_.Name -match '(?i)llama(-|_)server\.exe$' -or $_.Name -match '(?i)^server\.exe$'
-          } | Select-Object -First 1
-          if (-not $found) {
-            Write-Host "=== build/llama_server ==="; Get-ChildItem -Recurse build/llama_server | Select-Object FullName
-            throw "Нет сервера в build/llama_server (см. листинг)"
-          }
-          Write-Host "Движок на месте: $($found.FullName)"
+        run: Set-Content "$env:PKG/start.bat" @('@echo off', 'cd /d "%~dp0"', 'python.exe app.py')
 
-      - name: Сборка (PyInstaller onedir)
-        run: pyinstaller gguf-ui.spec --noconfirm
-
-      - name: Проверить состав сборки
+      - name: Проверка импорта в переносимом Python (офлайн)
         shell: pwsh
+        env:
+          HF_HUB_OFFLINE: "1"
+          GRADIO_ANALYTICS_ENABLED: "False"
         run: |
-          $root = "dist/GGUFChat/_internal"
-          if (!(Test-Path "$root/llama_server/llama-server.exe")) { throw "В сборке нет llama-server.exe" }
-          Write-Host "Сборка в порядке."
+          Push-Location "$env:PKG"
+          .\python.exe -c "import gradio, app; print('import OK')"
+          Pop-Location
+
+      - name: Упаковать ZIP
+        shell: pwsh
+        run: Compress-Archive -Path "$env:PKG/*" -DestinationPath GGUFChat-windows.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: GGUFChat-windows
-          path: dist/GGUFChat
-          retention-days: 30
-
-      - name: Диагностическая сборка (консоль + GGUF_DEBUG)
-        env:
-          GGUF_CONSOLE: "1"
-          GGUF_APP_NAME: "GGUFChat-debug"
-        run: pyinstaller gguf-ui.spec --noconfirm
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: GGUFChat-windows-debug
-          path: dist/GGUFChat-debug
+          path: GGUFChat-windows.zip
           retention-days: 30
