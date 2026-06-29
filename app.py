@@ -3,8 +3,16 @@ import os
 import constants as const
 
 _dll_directory = None
+_tk_dlls = []
 if os.name == "nt" and hasattr(os, "add_dll_directory"):
-    _dll_directory = os.add_dll_directory(os.path.dirname(os.path.abspath(__file__)))
+    import ctypes
+
+    _app_directory = os.path.dirname(os.path.abspath(__file__))
+    _dll_directory = os.add_dll_directory(_app_directory)
+    for _dll_name in ("tcl86t.dll", "tk86t.dll"):
+        _dll_path = os.path.join(_app_directory, _dll_name)
+        if os.path.isfile(_dll_path):
+            _tk_dlls.append(ctypes.WinDLL(_dll_path))
 
 os.environ.setdefault(const.ENV_GRADIO_ANALYTICS, "False")
 os.environ.setdefault(const.ENV_HF_OFFLINE, "1")

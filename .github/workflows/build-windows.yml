@@ -113,14 +113,6 @@ jobs:
         run: |
           $env:TCL_LIBRARY = (Resolve-Path "$env:PKG/tcl/tcl8.6").Path
           $env:TK_LIBRARY = (Resolve-Path "$env:PKG/tcl/tk8.6").Path
-          Get-ChildItem "$env:PKG" -File | Where-Object { $_.Name -match '(?i)(_tkinter|tcl|tk).*\.(pyd|dll)$' }
-          $objdump = "$env:ProgramFiles/LLVM/bin/llvm-objdump.exe"
-          if (Test-Path $objdump) {
-            Get-ChildItem "$env:PKG" -File | Where-Object { $_.Name -match '(?i)(_tkinter|tcl|tk).*\.(pyd|dll)$' } | ForEach-Object {
-              Write-Host "Dependencies: $($_.Name)"
-              & $objdump -p $_.FullName | Select-String 'DLL Name'
-            }
-          }
           Push-Location "$env:PKG"
           .\python.exe -c "import app, tkinter; root = tkinter.Tk(); root.withdraw(); root.destroy(); print('Tkinter + import OK')"
           Pop-Location
