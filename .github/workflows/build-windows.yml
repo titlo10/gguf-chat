@@ -47,18 +47,20 @@ jobs:
           $dllDir = Split-Path -Parent $tkinter
           $tclDll = Get-ChildItem $dllDir -Filter 'tcl*t.dll' | Select-Object -First 1
           $tkDll = Get-ChildItem $dllDir -Filter 'tk*t.dll' | Select-Object -First 1
+          $zlibDll = Get-ChildItem $dllDir -Filter 'zlib1.dll' | Select-Object -First 1
           $tclRoot = Join-Path $base 'tcl'
           $tkinterLib = Join-Path $base 'Lib/tkinter'
-          if (-not ($tkinter -and $tclDll -and $tkDll -and
+          if (-not ($tkinter -and $tclDll -and $tkDll -and $zlibDll -and
                     (Test-Path $tclRoot) -and (Test-Path $tkinterLib))) {
             throw "Не найдены компоненты Tkinter в $base"
           }
           Copy-Item -LiteralPath $tkinter -Destination "$env:PKG/_tkinter.pyd" -Force
           Copy-Item -LiteralPath $tclDll.FullName -Destination "$env:PKG/$($tclDll.Name)" -Force
           Copy-Item -LiteralPath $tkDll.FullName -Destination "$env:PKG/$($tkDll.Name)" -Force
+          Copy-Item -LiteralPath $zlibDll.FullName -Destination "$env:PKG/$($zlibDll.Name)" -Force
           Copy-Item $tclRoot "$env:PKG/tcl" -Recurse -Force
           Copy-Item $tkinterLib "$env:PKG/libs/tkinter" -Recurse -Force
-          @('_tkinter.pyd', $tclDll.Name, $tkDll.Name) | ForEach-Object {
+          @('_tkinter.pyd', $tclDll.Name, $tkDll.Name, $zlibDll.Name) | ForEach-Object {
             if (-not (Test-Path "$env:PKG/$_")) { throw "Не скопирован $_" }
           }
 
