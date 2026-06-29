@@ -2,6 +2,10 @@ import os
 
 import constants as const
 
+_dll_directory = None
+if os.name == "nt" and hasattr(os, "add_dll_directory"):
+    _dll_directory = os.add_dll_directory(os.path.dirname(os.path.abspath(__file__)))
+
 os.environ.setdefault(const.ENV_GRADIO_ANALYTICS, "False")
 os.environ.setdefault(const.ENV_HF_OFFLINE, "1")
 

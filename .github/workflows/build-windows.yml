@@ -53,9 +53,14 @@ jobs:
                     (Test-Path $tclRoot) -and (Test-Path $tkinterLib))) {
             throw "Не найдены компоненты Tkinter в $base"
           }
-          Copy-Item $tkinter, $tclDll.FullName, $tkDll.FullName "$env:PKG/" -Force
+          Copy-Item -LiteralPath $tkinter -Destination "$env:PKG/_tkinter.pyd" -Force
+          Copy-Item -LiteralPath $tclDll.FullName -Destination "$env:PKG/$($tclDll.Name)" -Force
+          Copy-Item -LiteralPath $tkDll.FullName -Destination "$env:PKG/$($tkDll.Name)" -Force
           Copy-Item $tclRoot "$env:PKG/tcl" -Recurse -Force
           Copy-Item $tkinterLib "$env:PKG/libs/tkinter" -Recurse -Force
+          @('_tkinter.pyd', $tclDll.Name, $tkDll.Name) | ForEach-Object {
+            if (-not (Test-Path "$env:PKG/$_")) { throw "Не скопирован $_" }
+          }
 
       - name: Скачать llama-server (CUDA) + cudart
         shell: pwsh
@@ -103,7 +108,7 @@ jobs:
           $env:TCL_LIBRARY = (Resolve-Path "$env:PKG/tcl/tcl8.6").Path
           $env:TK_LIBRARY = (Resolve-Path "$env:PKG/tcl/tk8.6").Path
           Push-Location "$env:PKG"
-          .\python.exe -c "import tkinter; root = tkinter.Tk(); root.withdraw(); root.destroy(); import gradio, app; print('Tkinter + import OK')"
+          .\python.exe -c "import app, tkinter; root = tkinter.Tk(); root.withdraw(); root.destroy(); print('Tkinter + import OK')"
           Pop-Location
 
       - name: Упаковать ZIP
