@@ -28,5 +28,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
         run: gh release create "$TAG" release/GGUFChat-windows.zip --title "$TAG" --notes ""
