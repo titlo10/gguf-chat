@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.7'
 
       - name: Зависимости в libs (офлайн)
         shell: pwsh
@@ -37,6 +37,25 @@ jobs:
           Expand-Archive py.zip -DestinationPath "$env:PKG" -Force
           $pth = (Get-ChildItem "$env:PKG" -Filter "python*._pth" | Select-Object -First 1).FullName
           Set-Content $pth @('python312.zip', '.', 'libs', 'import site')
+
+      - name: Добавить Tkinter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = python -c "import sys; print(sys.base_prefix)"
+          $tkinter = python -c "import _tkinter; print(_tkinter.__file__)"
+          $dllDir = Split-Path -Parent $tkinter
+          $tclDll = Get-ChildItem $dllDir -Filter 'tcl*t.dll' | Select-Object -First 1
+          $tkDll = Get-ChildItem $dllDir -Filter 'tk*t.dll' | Select-Object -First 1
+          $tclRoot = Join-Path $base 'tcl'
+          $tkinterLib = Join-Path $base 'Lib/tkinter'
+          if (-not ($tkinter -and $tclDll -and $tkDll -and
+                    (Test-Path $tclRoot) -and (Test-Path $tkinterLib))) {
+            throw "Не найдены компоненты Tkinter в $base"
+          }
+          Copy-Item $tkinter, $tclDll.FullName, $tkDll.FullName "$env:PKG/" -Force
+          Copy-Item $tclRoot "$env:PKG/tcl" -Recurse -Force
+          Copy-Item $tkinterLib "$env:PKG/libs/tkinter" -Recurse -Force
 
       - name: Скачать llama-server (CUDA) + cudart
         shell: pwsh
@@ -66,7 +85,14 @@ jobs:
 
       - name: Лаунчер start.bat
         shell: pwsh
-        run: Set-Content "$env:PKG/start.bat" @('@echo off', 'cd /d "%~dp0"', 'python.exe app.py')
+        run: |
+          Set-Content "$env:PKG/start.bat" @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'set "TCL_LIBRARY=%~dp0tcl\tcl8.6"',
+            'set "TK_LIBRARY=%~dp0tcl\tk8.6"',
+            'python.exe app.py'
+          )
 
       - name: Проверка импорта в переносимом Python (офлайн)
         shell: pwsh
@@ -74,8 +100,10 @@ jobs:
           HF_HUB_OFFLINE: "1"
           GRADIO_ANALYTICS_ENABLED: "False"
         run: |
+          $env:TCL_LIBRARY = (Resolve-Path "$env:PKG/tcl/tcl8.6").Path
+          $env:TK_LIBRARY = (Resolve-Path "$env:PKG/tcl/tk8.6").Path
           Push-Location "$env:PKG"
-          .\python.exe -c "import gradio, app; print('import OK')"
+          .\python.exe -c "import tkinter; root = tkinter.Tk(); root.withdraw(); root.destroy(); import gradio, app; print('Tkinter + import OK')"
           Pop-Location
 
       - name: Упаковать ZIP

@@ -3,13 +3,17 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Repo = Split-Path -Parent $Here
 Set-Location $Repo
 
-$Py = if (Get-Command py -ErrorAction SilentlyContinue) { "py" } else { "python" }
 if (-not (Test-Path ".venv")) {
     Write-Host "==> Создаю venv"
-    & $Py -3 -m venv .venv
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        py -3 -m venv .venv
+    } else {
+        python -m venv .venv
+    }
 }
 & ".venv\Scripts\python.exe" -m pip install --upgrade pip
 & ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+& ".venv\Scripts\python.exe" -c "import tkinter; print('Tkinter', tkinter.TkVersion)"
 
 Write-Host "==> Скачиваю официальный llama.cpp (CUDA) + CUDA runtime"
 $rel = Invoke-RestMethod -Headers @{ "User-Agent" = "gguf-ui" } `

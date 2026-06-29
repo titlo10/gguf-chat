@@ -1,3 +1,5 @@
+import codecs
+import functools
 import os
 
 import constants as const
@@ -6,6 +8,10 @@ import constants as const
 def _read_text_file(path):
     with open(path, "rb") as f:
         raw = f.read()
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode("utf-8-sig")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
     for enc in const.DOC_ENCODINGS:
         try:
             return raw.decode(enc)
@@ -26,10 +32,16 @@ def _extract_docx(path):
     return "\n".join(p.text for p in document.paragraphs)
 
 
-def extract_document_text(path):
+@functools.lru_cache(maxsize=1)
+def _extract_document_text(path, _mtime_ns, _size):
     ext = os.path.splitext(path)[1].lower()
     if ext == const.PDF_EXT:
         return _extract_pdf(path)
     if ext == const.DOCX_EXT:
         return _extract_docx(path)
     return _read_text_file(path)
+
+
+def extract_document_text(path):
+    stat = os.stat(path)
+    return _extract_document_text(path, stat.st_mtime_ns, stat.st_size)

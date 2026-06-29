@@ -24,12 +24,6 @@ def dbg(msg):
         pass
 
 
-class Role(enum.StrEnum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-
-
 class Channel(enum.StrEnum):
     CONTENT = "content"
     REASONING = "reasoning"
@@ -60,10 +54,9 @@ class LlmEngine:
     def __init__(self):
         self.proc = None
         self.port = None
-        self.status = const.STATUS_NOT_LOADED
         self._loaded = False
         self._stderr = []
-        self._cancel = threading.Event()
+        self.last_usage = None
 
     def _server_exe(self):
         bases = (bundle_dir(), os.path.join(app_dir(), const.BUILD_SUBDIR))
@@ -129,7 +122,7 @@ class LlmEngine:
             except Exception:
                 pass
 
-    def _start(self, exe, model_path, n_ctx, ngl, log):
+    def _start(self, exe, model_path, n_ctx, ngl):
         self.port = self._free_port()
         self._stderr = []
         argv = [
@@ -170,52 +163,33 @@ class LlmEngine:
             time.sleep(const.POLL_INTERVAL)
         return False, const.ERR_TIMEOUT
 
-    def _status_from_log(self, ngl):
-        text = "\n".join(self._stderr).lower()
-        gpu = any(marker in text for marker in const.GPU_MARKERS)
-        if ngl == 0:
-            return const.STATUS_CPU
-        if gpu:
-            return const.STATUS_GPU
-        return const.STATUS_CPU_FALLBACK
-
-    def load(self, model_path: str, n_ctx: int, requested_ngl: int, on_log=None):
-        def log(msg):
-            if on_log:
-                on_log(msg)
-
+    def load(self, model_path: str, n_ctx: int):
         self.shutdown()
         exe = self._server_exe()
         if not exe:
             raise RuntimeError(const.ERR_NO_SERVER)
 
-        req = const.NGL_ALL if int(requested_ngl) >= const.NGL_ALL_THRESHOLD else int(requested_ngl)
-        attempts = [req] if req == 0 else [req, 0]
         last = ""
-        for ngl in attempts:
-            log(const.LOG_STARTING % ngl)
-            ok, err = self._start(exe, model_path, n_ctx, ngl, log)
+        for ngl in (const.NGL_ALL, 0):
+            ok, err = self._start(exe, model_path, n_ctx, ngl)
             if ok:
                 self._loaded = True
-                self.status = self._status_from_log(ngl)
-                log(self.status)
-                return self.status
+                return
             last = err
             self.shutdown()
-            if ngl != attempts[-1]:
-                log(const.LOG_FALLBACK)
 
         raise RuntimeError(const.ERR_LOAD_FAILED + (last or const.ERR_UNKNOWN))
-
-    def cancel(self):
-        self._cancel.set()
 
     def stream_chat(self, messages, **params):
         if not self.is_loaded():
             raise RuntimeError(const.STATUS_NOT_LOADED)
-        self._cancel.clear()
+        self.last_usage = None
 
-        payload = {"messages": messages, "stream": True}
+        payload = {
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
         for key in const.STREAM_PARAM_KEYS:
             if params.get(key) is not None:
                 payload[key] = params[key]
@@ -236,8 +210,6 @@ class LlmEngine:
 
         try:
             for raw in resp:
-                if self._cancel.is_set():
-                    break
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith(const.SSE_PREFIX):
                     continue
@@ -248,7 +220,13 @@ class LlmEngine:
                     obj = json.loads(chunk)
                 except Exception:
                     continue
-                delta = obj.get("choices", [{}])[0].get("delta", {})
+                usage = obj.get("usage")
+                if isinstance(usage, dict):
+                    self.last_usage = usage
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
                     yield Channel.REASONING, reasoning
