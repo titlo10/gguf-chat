@@ -64,9 +64,15 @@ jobs:
 
       - name: Скачать llama-server (CUDA) + cudart
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $rel = Invoke-RestMethod -Headers @{ "User-Agent" = "gguf-ui" } `
+          $rel = Invoke-RestMethod -Headers @{
+                   "User-Agent" = "gguf-ui"
+                   "Authorization" = "Bearer $env:GH_TOKEN"
+                   "X-GitHub-Api-Version" = "2022-11-28"
+                 } `
                  -Uri "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
           $cuda = $rel.assets |
             Where-Object { $_.name -match '(?i)bin-win-cuda-.*x64.*\.zip$' -and $_.name -notmatch '(?i)cudart' } |
